@@ -20,7 +20,8 @@ import {
   notifyMatchedUser,
   checkMatchLimit,
   recordMatchRequest,
-  recordMatches
+  recordMatches,
+  getMatchHistory
 } from "../utils/matchingUtils";
 import { DAILY_MATCH_LIMIT, SEND_TELEGRAM_GROUP_INVITES } from "../utils/constants";
 import { mongoDbManager } from "../utils/mongoDbManager";
@@ -481,18 +482,34 @@ export const publishAndFindMatch: Action = {
       }
 
       DataBaristaLogger.info("Storing profile in database...");
-      
-      // Check if this is a first-time user
-      const isFirstTimeUser = combinedProfile.analysis.matchType === "new_information" && 
-                             (!userProfileData || userProfileData.length === 0 || !userProfileData.some(profile => profile.latestProfile));
-      
+
+      // Log profile information for debugging
+      DataBaristaLogger.info(`Profile info - userProfileData exists: ${!!userProfileData}, array length: ${userProfileData ? userProfileData.length : 0}`);
+      if (userProfileData && userProfileData.length > 0) {
+        DataBaristaLogger.info(`Profile has latestProfile: ${!!userProfileData.some(profile => profile.latestProfile)}`);
+      }
+      DataBaristaLogger.info(`combinedProfile.analysis.matchType: ${combinedProfile.analysis.matchType}`);
+
+      // Simplified first-time user check - check if the user has any match history
+      const matchHistory = await getMatchHistory(runtime, platform, username);
+      const isFirstTimeUser = !matchHistory || matchHistory.length === 0;
+
+      DataBaristaLogger.info(`User is identified as first-time user: ${isFirstTimeUser}, match history length: ${matchHistory ? matchHistory.length : 0}`);
+
       // Send invitation to first-time users if feature is enabled
       if (isFirstTimeUser && SEND_TELEGRAM_GROUP_INVITES) {
         DataBaristaLogger.info("First-time user detected, sending Telegram group invitation");
         const telegramInviteLink = runtime.getSetting("TELEGRAM_INVITE_LINK");
-        callback({
-          text: `While I am searching my network for the best match, feel free to join my corner store cafe via this invite to my secret telegram group: ${telegramInviteLink}`
-        });
+        
+        // Check if the invite link exists
+        if (!telegramInviteLink) {
+          DataBaristaLogger.error("No TELEGRAM_INVITE_LINK configured in settings");
+        } else {
+          DataBaristaLogger.info(`Sending invitation with link: ${telegramInviteLink}`);
+          callback({
+            text: `While I am searching my network for the best match, feel free to join my corner store cafe via this invite to my secret telegram group: ${telegramInviteLink}`
+          });
+        }
       }
 
       // Store profile and get embeddings in one operation
