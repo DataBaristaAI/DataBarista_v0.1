@@ -2,7 +2,6 @@ import {
     IAgentRuntime,
     Memory,
     State,
-    elizaLogger,
     ModelClass,
     ActionExample,
     type Action,
@@ -10,7 +9,6 @@ import {
     generateObjectArray,
     embed
   } from "@elizaos/core";
-import { MongoClient } from 'mongodb';
 import { MATCH_PROMPT_TEMPLATE } from "../utils/promptTemplates";
 import { getProfile } from "../utils/profileUtils";
 import { 
@@ -22,6 +20,9 @@ import {
   recordMatches
 } from "../utils/matchingUtils";
 import { DAILY_MATCH_LIMIT } from "../utils/constants";
+import { mongoDbManager } from "../utils/mongoDbManager";
+import { DataBaristaLogger } from "../utils/loggingUtils";
+import { dataCache } from "../utils/cacheUtils";
 
 /**
  * Interface for profile data
@@ -57,7 +58,7 @@ async function generateProfileEmbeddings(
     ]);
     
     if (!profileEmbedding || !idealEmbedding) {
-      elizaLogger.error("Failed to generate embeddings for profile");
+      DataBaristaLogger.error("Failed to generate embeddings for profile");
       return null;
     }
     
@@ -66,7 +67,7 @@ async function generateProfileEmbeddings(
       ideal_embedding: idealEmbedding
     };
   } catch (error) {
-    elizaLogger.error("Error generating profile embeddings:", error);
+    DataBaristaLogger.error("Error generating profile embeddings:", error);
     return null;
   }
 }
@@ -100,7 +101,7 @@ async function storeProfile(
     
     // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return null;
     }
     
@@ -123,7 +124,7 @@ async function storeProfile(
     // Generate embeddings for the profile
     const embeddings = await generateProfileEmbeddings(runtime, profile);
     if (!embeddings) {
-      elizaLogger.error("Failed to generate embeddings for profile");
+      DataBaristaLogger.error("Failed to generate embeddings for profile");
       return null;
     }
     
@@ -137,10 +138,10 @@ async function storeProfile(
       ideal_embedding: embeddings.ideal_embedding
     };
     
-    // Connect to MongoDB and perform operations in one session
-    const client = await MongoClient.connect(connectionString);
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for storing profile in ${Date.now() - startTime}ms`);
     
     // Find existing document
     const existingProfile = await collection.findOne({ platform, username });
@@ -157,7 +158,8 @@ async function storeProfile(
           $addToSet: {
             profileVersions: profileData
           }
-        }
+        } as any,
+        { upsert: true }
       );
     } else {
       // New user - create profile
@@ -175,10 +177,13 @@ async function storeProfile(
       });
     }
     
-    await client.close();
+    // Update the cache with the new profile
+    const cacheKey = `profile:${platform}:${username}`;
+    dataCache.delete(cacheKey);
+    
     return embeddings; // Return the embeddings for reuse
   } catch (error) {
-    elizaLogger.error("Error storing profile:", error);
+    DataBaristaLogger.error("Error storing profile:", error);
     return null;
   }
 }
@@ -217,7 +222,7 @@ async function formatMatchesAsText(
     };
     
     // Log preparation information
-    elizaLogger.info(`Preparing match post for ${username} with ${matches.length} candidates`);
+    DataBaristaLogger.info(`Preparing match post for ${username} with ${matches.length} candidates`);
     
     // Create context and generate post
     const matchPromptContext = composeContext({
@@ -226,7 +231,7 @@ async function formatMatchesAsText(
     });
     
     // Log raw prompt content
-    elizaLogger.info(`RAW_MATCH_PROMPT: ${matchPromptContext}`);
+    DataBaristaLogger.info(`RAW_MATCH_PROMPT: ${matchPromptContext}`);
     
     // Generate the post text from the candidate profiles
     const postResult = await generateObjectArray({
@@ -236,7 +241,7 @@ async function formatMatchesAsText(
     });
     
     // Log raw LLM response
-    elizaLogger.info(`RAW_MATCH_RESPONSE: ${JSON.stringify(postResult)}`);
+    DataBaristaLogger.info(`RAW_MATCH_RESPONSE: ${JSON.stringify(postResult)}`);
     
     if (!postResult?.length) {
       return "Found matches but couldn't generate the post. Please try again later!";
@@ -247,7 +252,7 @@ async function formatMatchesAsText(
     const postMessage = matchData?.post || "Found matches but couldn't format the message properly. Please try again!";
     
     // Log LLM result (minimal)
-    elizaLogger.info(`Match post generated for ${username} with match: ${matchData?.matchUsername || "unknown"}`);
+    DataBaristaLogger.info(`Match post generated for ${username} with match: ${matchData?.matchUsername || "unknown"}`);
     
     // Record the match if we have match details
     if (matchData?.matchUsername && matchData?.matchPlatform) {
@@ -271,7 +276,7 @@ async function formatMatchesAsText(
     
     return postMessage;
   } catch (error) {
-    elizaLogger.error("Error formatting matches:", error);
+    DataBaristaLogger.error("Error formatting matches:", error);
     return "I found some matches for you, but encountered an error while formatting the results.";
   }
 }
@@ -292,8 +297,11 @@ export const serendipityAction: Action = {
   
   handler: async (runtime: IAgentRuntime, message: any, state?: any, _conversation?: any, callback?: any): Promise<boolean> => {
     try {
+      // Initialize the logger with the current runtime
+      DataBaristaLogger.initialize(runtime);
+      
       if (!callback) {
-        elizaLogger.error("No callback function provided");
+        DataBaristaLogger.error("No callback function provided");
         return false;
       }
 
@@ -302,7 +310,7 @@ export const serendipityAction: Action = {
       const username = activeState?.actorsData?.find((actor: any) => actor.id === message.userId)?.username || message.userId;
       const platform = Object.keys(runtime.clients)[0];
 
-      elizaLogger.info("Processing serendipity request for:", { username, platform });
+      DataBaristaLogger.info("Processing serendipity request for:", { username, platform });
   
       // Fetch user profile and check match limit in parallel for faster execution
       const [userProfileData, matchLimit] = await Promise.all([
@@ -311,7 +319,7 @@ export const serendipityAction: Action = {
       ]);
       
       if (matchLimit.isLimited) {
-        elizaLogger.info(`User has reached the daily match limit of ${DAILY_MATCH_LIMIT} matches.`);
+        DataBaristaLogger.info(`User has reached the daily match limit of ${DAILY_MATCH_LIMIT} matches.`);
         
         const resetTime = new Date(matchLimit.resetTime || new Date());
         const formattedResetTime = resetTime.toLocaleString('en-US', {
@@ -348,7 +356,7 @@ export const serendipityAction: Action = {
       
       if (!userProfile || !userProfile.ideal_embedding) {
         // Generate new profile if none exists or if no embeddings
-        elizaLogger.info("No profile with embeddings found, generating one now...");
+        DataBaristaLogger.info("No profile with embeddings found, generating one now...");
         const combinedProfile = await generateCombinedProfile(runtime, userProfileData, activeState);
         
         if (!combinedProfile) {
@@ -390,7 +398,7 @@ export const serendipityAction: Action = {
         idealEmbedding = userProfile.ideal_embedding;
       }
       
-      elizaLogger.info(`Using embedding with ${idealEmbedding.length} dimensions for search`);
+      DataBaristaLogger.info(`Using embedding with ${idealEmbedding.length} dimensions for search`);
       
       // Find matches using vector search
       const candidates = await findMatchingProfilesWithAtlasSearch(
@@ -425,7 +433,7 @@ export const serendipityAction: Action = {
       let remainingCountMessage = "";
       if (updatedMatchLimit.remaining !== undefined) {
         // Log match limit info
-        elizaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
+        DataBaristaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
         
         // Use the updated remaining count that accounts for the request we just recorded
         const actualRemaining = updatedMatchLimit.remaining;
@@ -447,7 +455,7 @@ export const serendipityAction: Action = {
       callback({ text: `${formattedResponse}${remainingCountMessage}` });
         return true;
       } catch (error) {
-      elizaLogger.error("Error in serendipity handler:", error);
+      DataBaristaLogger.error("Error in serendipity handler:", error);
       callback({ text: "I encountered an error while processing your request. Please try again later." });
         return false;
       }

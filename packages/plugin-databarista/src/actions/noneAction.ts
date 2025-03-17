@@ -5,8 +5,8 @@ import {
     elizaLogger,
     type Action,
 } from "@elizaos/core";
-import { sendInlineKeyboardToUser, InlineKeyboardButtonType } from "../utils/telegramUtils";
-import { setupTelegramCallbackHandlers } from "../utils/telegramHandlers";
+//import { sendInlineKeyboardToUser, InlineKeyboardButtonType } from "../utils/telegramUtils";
+//import { setupTelegramCallbackHandlers } from "../utils/telegramHandlers";
 
 export const noneAction: Action = {
     name: "NONE",
@@ -29,34 +29,34 @@ export const noneAction: Action = {
     ): Promise<boolean> => {
         try {
             // Log that noneAction handler was called
-            elizaLogger.info("DATABARISTA DEBUG: noneAction handler called");
+            //elizaLogger.info("DATABARISTA DEBUG: noneAction handler called");
             
             // Ensure callback handlers are set up
-            if (runtime.clients['telegram'] && runtime.clients['telegram'].bot) {
+            //if (runtime.clients['telegram'] && runtime.clients['telegram'].bot) {
                 // Make sure callback handlers are initialized
-                setupTelegramCallbackHandlers(runtime.clients['telegram'].bot);
-            }
+                //setupTelegramCallbackHandlers(runtime.clients['telegram'].bot);
+            //}
             
             // Create state object to access additional properties
-            const state = await runtime.composeState(message);
+            //const state = await runtime.composeState(message);
             
             // Extract username and platform the same way as in publishAndFindMatch.ts and userProfileProvider.ts
-            const username = state?.actorsData?.find(actor => actor.id === message.userId)?.username || message.userId;
-            const platform = Object.keys(runtime.clients)[0];
+            //const username = state?.actorsData?.find(actor => actor.id === message.userId)?.username || message.userId;
+            //const platform = Object.keys(runtime.clients)[0];
             
             // Log state information for debugging
-            elizaLogger.info(`DATABARISTA DEBUG: Message userId: ${message.userId}`);
-            elizaLogger.info(`DATABARISTA DEBUG: Extracted username: ${username}, platform: ${platform}`);
+            //elizaLogger.info(`DATABARISTA DEBUG: Message userId: ${message.userId}`);
+            //elizaLogger.info(`DATABARISTA DEBUG: Extracted username: ${username}, platform: ${platform}`);
             
             // Check if this is a Telegram platform interaction
-            if (platform === 'telegram' && username) {
-                elizaLogger.info(`DATABARISTA DEBUG: Processing Telegram message for user: ${username}`);
+            //if (platform === 'telegram' && username) {
+                //elizaLogger.info(`DATABARISTA DEBUG: Processing Telegram message for user: ${username}`);
                 
                 // Get the response text from message content
-                const responseText = message.content?.text || 'Please select an option:';
+                //const responseText = message.content?.text || 'Please select an option:';
                 
                 // INLINE KEYBOARD FUNCTIONALITY DISABLED
-                elizaLogger.info(`DATABARISTA DEBUG: Inline keyboard functionality is currently disabled in noneAction`);
+                //elizaLogger.info(`DATABARISTA DEBUG: Inline keyboard functionality is currently disabled in noneAction`);
                 
                 /*
                 // Define custom buttons for this interaction - using switch_inline_query_current_chat to pre-fill input
@@ -88,9 +88,9 @@ export const noneAction: Action = {
                     elizaLogger.warn(`Failed to send Telegram inline keyboard to user ${username}`);
                 }
                 */
-            } else {
-                elizaLogger.info(`DATABARISTA DEBUG: Not a valid Telegram interaction - platform: ${platform}, username: ${username}`);
-            }
+            //} else {
+                //elizaLogger.info(`DATABARISTA DEBUG: Not a valid Telegram interaction - platform: ${platform}, username: ${username}`);
+            //}
         } catch (error) {
             elizaLogger.error(`Error in noneAction handler: ${error}`);
         }

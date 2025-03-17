@@ -23,6 +23,9 @@ import {
   recordMatches
 } from "../utils/matchingUtils";
 import { DAILY_MATCH_LIMIT, SEND_TELEGRAM_GROUP_INVITES } from "../utils/constants";
+import { mongoDbManager } from "../utils/mongoDbManager";
+import { DataBaristaLogger } from "../utils/loggingUtils";
+import { dataCache } from "../utils/cacheUtils";
 
 /**
  * Profile data interface - streamlined for efficiency
@@ -102,7 +105,7 @@ async function storeProfile(
     
     // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return null;
     }
     
@@ -125,7 +128,7 @@ async function storeProfile(
     // Generate embeddings for the profile
     const embeddings = await generateProfileEmbeddings(runtime, profile);
     if (!embeddings) {
-      elizaLogger.error("Failed to generate embeddings for profile");
+      DataBaristaLogger.error("Failed to generate embeddings for profile");
       return null;
     }
     
@@ -139,10 +142,10 @@ async function storeProfile(
       ideal_embedding: embeddings.ideal_embedding
     };
     
-    // Connect to MongoDB and perform operations in one session
-    const client = await MongoClient.connect(connectionString);
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for storing profile in ${Date.now() - startTime}ms`);
     
     // Find existing document
     const existingProfile = await collection.findOne({ platform, username });
@@ -159,7 +162,8 @@ async function storeProfile(
           $addToSet: {
             profileVersions: profileData
           }
-        }
+        } as any,
+        { upsert: true }
       );
     } else {
       // New user - create profile
@@ -177,10 +181,13 @@ async function storeProfile(
       });
     }
     
-    await client.close();
+    // Update the cache with the new profile
+    const cacheKey = `profile:${platform}:${username}`;
+    dataCache.delete(cacheKey);
+    
     return embeddings; // Return the embeddings for reuse
   } catch (error) {
-    elizaLogger.error("Error storing profile:", error);
+    DataBaristaLogger.error("Error storing profile:", error);
     return null;
   }
 }
@@ -219,7 +226,7 @@ async function formatMatchesAsText(
     };
 
     // Log prompt data (minimal)
-    elizaLogger.info(`Preparing match post for ${username} with ${matches.length} candidates`);
+    DataBaristaLogger.info(`Preparing match post for ${username} with ${matches.length} candidates`);
     
     // Create context and generate post
     const matchPromptContext = composeContext({
@@ -228,7 +235,7 @@ async function formatMatchesAsText(
     });
     
     // Log raw prompt content
-    elizaLogger.info(`RAW_MATCH_PROMPT: ${matchPromptContext}`);
+    DataBaristaLogger.info(`RAW_MATCH_PROMPT: ${matchPromptContext}`);
 
     const postResult = await generateObjectArray({
       runtime,
@@ -237,7 +244,7 @@ async function formatMatchesAsText(
     });
 
     // Log raw LLM response
-    elizaLogger.info(`RAW_MATCH_RESPONSE: ${JSON.stringify(postResult)}`);
+    DataBaristaLogger.info(`RAW_MATCH_RESPONSE: ${JSON.stringify(postResult)}`);
 
     if (!postResult?.length) {
       return "I've found some matches for you, but couldn't generate the introduction. Please try again!";
@@ -248,7 +255,7 @@ async function formatMatchesAsText(
     const postMessage = matchData?.post || "Found matches but couldn't format the message properly. Please try again!";
     
     // Log LLM result (minimal)
-    elizaLogger.info(`Match post generated for ${username} with match: ${matchData?.matchUsername || "unknown"}`);
+    DataBaristaLogger.info(`Match post generated for ${username} with match: ${matchData?.matchUsername || "unknown"}`);
     
     // Record the match if we have match details
     if (matchData?.matchUsername && matchData?.matchPlatform) {
@@ -272,7 +279,7 @@ async function formatMatchesAsText(
     
     return postMessage;
   } catch (error) {
-    elizaLogger.error("Error formatting matches:", error);
+    DataBaristaLogger.error("Error formatting matches:", error);
     return "I found some matches for you, but encountered an error while formatting the results.";
   }
 }
@@ -284,6 +291,9 @@ export async function processMatchmaking(
   username: string,
   state: State
 ): Promise<string> {
+  
+  // Initialize the logger with the current runtime
+  DataBaristaLogger.initialize(runtime);
   
   // Fetch user profile and check match limit in parallel for faster execution
   const [userProfileData, matchLimit] = await Promise.all([
@@ -377,7 +387,7 @@ export async function processMatchmaking(
   let remainingCountMessage = "";
   if (updatedMatchLimit.remaining !== undefined) {
     // Log match limit info
-    elizaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
+    DataBaristaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
     
     // Use the updated remaining count
     const actualRemaining = updatedMatchLimit.remaining;
@@ -428,11 +438,14 @@ export const publishAndFindMatch: Action = {
     callback: HandlerCallback    
   ): Promise<boolean> => {
     try {
+      // Initialize the logger with the current runtime
+      DataBaristaLogger.initialize(runtime);
+      
       // Extract username and platform
       const username = state?.actorsData?.find(actor => actor.id === message.userId)?.username || message.userId;
       const platform = Object.keys(runtime.clients)[0];
 
-      elizaLogger.info("Processing match request for:", { username, platform });
+      DataBaristaLogger.info("Processing match request for:", { username, platform });
 
       // Update state with user information and recent messages
       state = state || await runtime.composeState(message);
@@ -447,11 +460,11 @@ export const publishAndFindMatch: Action = {
       //state.shaclShapes = SHACL_SHAPES;
       
       // Generate combined profile
-      elizaLogger.info("Generating combined profile...");
+      DataBaristaLogger.info("Generating combined profile...");
       const combinedProfile = await generateCombinedProfile(runtime, userProfileData, state);
       
       if (!combinedProfile) {
-        elizaLogger.error("Failed to generate combined profile");
+        DataBaristaLogger.error("Failed to generate combined profile");
         callback({
           text: "I think i need to know more about you. Please share more about background and goals."
         });
@@ -460,14 +473,14 @@ export const publishAndFindMatch: Action = {
       
       // If no updates needed, return early
       if (combinedProfile.analysis.matchType === "exact_match") {
-        elizaLogger.info("Exact match found - no updates needed");
+        DataBaristaLogger.info("Exact match found - no updates needed");
         callback({
           text: "I found your profile is already published and no update was needed! Let me know if you want to add any more details about yourself or who you are looking to connect with."
         });
         return true;
       }
 
-      elizaLogger.info("Storing profile in database...");
+      DataBaristaLogger.info("Storing profile in database...");
       
       // Check if this is a first-time user
       const isFirstTimeUser = combinedProfile.analysis.matchType === "new_information" && 
@@ -475,7 +488,7 @@ export const publishAndFindMatch: Action = {
       
       // Send invitation to first-time users if feature is enabled
       if (isFirstTimeUser && SEND_TELEGRAM_GROUP_INVITES) {
-        elizaLogger.info("First-time user detected, sending Telegram group invitation");
+        DataBaristaLogger.info("First-time user detected, sending Telegram group invitation");
         const telegramInviteLink = runtime.getSetting("TELEGRAM_INVITE_LINK");
         callback({
           text: `While I am searching my network for the best match, feel free to join my corner store cafe via this invite to my secret telegram group: ${telegramInviteLink}`
@@ -491,7 +504,7 @@ export const publishAndFindMatch: Action = {
       );
       
       if (!storeResult) {
-        elizaLogger.error("Failed to store profile or generate embeddings");
+        DataBaristaLogger.error("Failed to store profile or generate embeddings");
         callback({ 
           text: "I'm having trouble updating your profile right now. Please try again in a moment." 
         });
@@ -544,7 +557,7 @@ export const publishAndFindMatch: Action = {
       let remainingCountMessage = "";
       if (updatedMatchLimit.remaining !== undefined) {
         // Log match limit info
-        elizaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
+        DataBaristaLogger.info(`Match limit for ${username}: ${updatedMatchLimit.remaining} remaining out of ${DAILY_MATCH_LIMIT}`);
         
         // Use the updated remaining count
         const actualRemaining = updatedMatchLimit.remaining;
@@ -566,7 +579,7 @@ export const publishAndFindMatch: Action = {
       callback({ text: `${formattedResponse}${remainingCountMessage}` });
       return true;
     } catch (error) {
-      elizaLogger.error("Error in publishAndFindMatch handler:", error);
+      DataBaristaLogger.error("Error in publishAndFindMatch handler:", error);
       callback({ text: "I encountered an error while processing your request. Please try again later." });
       return false;
     }

@@ -1,6 +1,8 @@
-import { Provider, IAgentRuntime, Memory, State, elizaLogger } from "@elizaos/core";
+import { Provider, IAgentRuntime, Memory, State } from "@elizaos/core";
 import { getProfile } from "../utils/profileUtils";
-import { MongoClient } from 'mongodb';
+import { mongoDbManager } from "../utils/mongoDbManager";
+import { DataBaristaLogger } from "../utils/loggingUtils";
+import { dataCache } from "../utils/cacheUtils";
 
 /**
  * Creates an initial minimal profile for a new user
@@ -21,7 +23,7 @@ async function createInitialUserProfile(
     
     // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return false;
     }
     
@@ -35,16 +37,16 @@ async function createInitialUserProfile(
     const telegramClient = runtime.clients['telegram'] as any;
     if (telegramClient?.bot?.botInfo?.username) {
       agentUsername = telegramClient.bot.botInfo.username.replace(/^@/, '');
-      elizaLogger.info(`Using actual bot username for profile: ${agentUsername}`);
+      DataBaristaLogger.info(`Using actual bot username for profile: ${agentUsername}`);
     }
     
     // Get community info - defaults to agent username if not available
     const community = state?.community || agentUsername;
     
-    // Connect to MongoDB
-    const client = await MongoClient.connect(connectionString);
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for creating initial profile in ${Date.now() - startTime}ms`);
     
     // Find existing document for this user
     const existingDoc = await collection.findOne({ platform, username });
@@ -65,17 +67,15 @@ async function createInitialUserProfile(
       
       await collection.insertOne(profileDocument);
       
-      elizaLogger.info(`Created initial profile for ${username} on ${platform}`);
-      await client.close();
+      DataBaristaLogger.info(`Created initial profile for ${username} on ${platform}`);
       return true;
     }
     
     // Profile already exists
-    elizaLogger.info(`Profile already exists for ${username} on ${platform}, skipping creation`);
-    await client.close();
+    DataBaristaLogger.info(`Profile already exists for ${username} on ${platform}, skipping creation`);
     return false;
   } catch (error) {
-    elizaLogger.error(`Error creating initial profile for ${username} on ${platform}: ${error instanceof Error ? error.message : String(error)}`);
+    DataBaristaLogger.error(`Error creating initial profile for ${username} on ${platform}: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }
@@ -108,20 +108,24 @@ function formatProfileForContext(userData: any[]): string {
 const userProfileProvider: Provider = {
   get: async (runtime: IAgentRuntime, message: Memory, state?: State): Promise<string | null> => {
     try {
+      // Initialize the logger with the current runtime
+      DataBaristaLogger.initialize(runtime);
+      
       // Get username from actorsData if available, otherwise fall back to userId
       const username = state?.actorsData?.find(actor => actor.id === message.userId)?.username || message.userId;
       
       // Get platform type from client
       const platform = Object.keys(runtime.clients)[0];
 
-      elizaLogger.info("Retrieving user profile:", { username, platform });
+      DataBaristaLogger.info("Retrieving user profile:", { username, platform });
 
       // Get profile using the profileUtils.getProfile function
+      // This already utilizes the caching mechanism from dataCache
       let userData = await getProfile(runtime, platform, username);
 
       // If no data found, create an initial profile
       if (!userData || userData.length === 0) {
-        elizaLogger.info(`No profile found for ${username}, creating initial profile`);
+        DataBaristaLogger.info(`No profile found for ${username}, creating initial profile`);
         
         // Get Telegram chat ID if available
         let telegramChatId: string | undefined;
@@ -160,7 +164,7 @@ ${formattedProfile}
 Task: Based on the profile and recent conversation, engage naturally to gather more information about the user's interests and what connections they're seeking. Focus on understanding their professional background, current projects, and the type of people they want to connect with.
 `;
     } catch (error) {
-      elizaLogger.error("Error in userProfileProvider:", error);
+      DataBaristaLogger.error("Error in userProfileProvider:", error);
       return "Error retrieving user profile. Continuing conversation normally.";
     }
   }

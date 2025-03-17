@@ -3,6 +3,9 @@
  */
 import { IAgentRuntime, elizaLogger } from "@elizaos/core";
 import { MongoClient } from 'mongodb';
+import { DataBaristaLogger } from "./loggingUtils";
+import { dataCache } from "./cacheUtils";
+import { mongoDbManager } from "./mongoDbManager";
 
 /**
  * Interface for profile data returned from MongoDB CKG
@@ -91,52 +94,45 @@ export async function getProfile(
   runtime: IAgentRuntime,
   platform: string,
   username: string
-): Promise<ProfileData[] | null> {
+): Promise<any[]> {
   try {
-    elizaLogger.info('Fetching user profile from MongoDB CKG for:', { platform, username });
+    // Generate a cache key for this profile query
+    const cacheKey = `profile:${platform}:${username}`;
     
-    const client = await ensureCkgConnection(runtime);
-    const db = client.db(runtime.getSetting('MONGODB_DATABASE_CKG'));
-    
-    // Check if MONGODB_DATABASE_COLLECTION is set in environment, otherwise use platform
-    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
-    const collection = db.collection(collectionName);
-    
-    // Optimized query that only fetches the necessary fields
-    // Excludes embedding fields by default to keep response size smaller
-    const results = await collection.find(
-      { platform, username },
-      { 
-        projection: {
-          platform: 1,
-          username: 1,
-          "latestProfile.private": 1,
-          "latestProfile.public": 1,
-          "latestProfile.ideal": 1,
-          "latestProfile.timestamp": 1,
-          "latestProfile.embedding": 1,
-          "latestProfile.ideal_embedding": 1,
-          timestamp: 1,
-          lastUpdated: 1,
-          "matchHistory": 1,
-          "matchRequests": 1,
-          "telegramChatId": 1,
-          "community": 1,
-          "agentUsername": 1
-        } 
-      }
-    ).sort({ lastUpdated: -1 }).toArray() as unknown as ProfileData[];
-    
-    elizaLogger.info(`Found ${results.length} profile(s) for ${username} on ${platform}`);
-    
-    if (results.length > 0) {
-      return results;
-    }
-    
-    elizaLogger.warn(`No profile found for ${username} on ${platform}`);
-    return null;
+    // Try to get from cache first
+    return await dataCache.getOrCompute<any[]>(
+      cacheKey,
+      async () => {
+        DataBaristaLogger.info(`Fetching user profile from MongoDB CKG for:\n    platform: "${platform}"\n    username: "${username}"`);
+        
+        const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
+        const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+        
+        if (!connectionString || !dbName) {
+          DataBaristaLogger.error('Missing MongoDB connection settings');
+          return [];
+        }
+        
+        // Get MongoDB collection from the connection pool
+        const startTime = Date.now();
+        const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
+        const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+        DataBaristaLogger.debug(`MongoDB collection obtained for profile retrieval in ${Date.now() - startTime}ms`);
+        
+        // Find all profiles for this username (old structure had multiple profiles)
+        const profiles = await collection.find({ 
+          platform, 
+          username
+        }).toArray();
+        
+        DataBaristaLogger.info(`Found ${profiles.length} profile(s) for ${username} on ${platform}`);
+        return profiles;
+      },
+      // Cache profiles for 5 minutes
+      5 * 60 * 1000
+    );
   } catch (error) {
-    elizaLogger.error(`Error fetching profile for ${username} on ${platform}: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
+    DataBaristaLogger.error(`Error retrieving profiles: ${error}`);
+    return [];
   }
 }

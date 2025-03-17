@@ -9,10 +9,30 @@ import {
   embed,
   type HandlerCallback
 } from "@elizaos/core";
-import { MongoClient } from 'mongodb';
+import { MongoClient, Document } from 'mongodb';
 import { COMBINED_PROFILE_TEMPLATE } from "./promptTemplates";
 import { SHACL_SHAPES } from "./shaclShapes";
 import { DAILY_MATCH_LIMIT, DEFAULT_VECTOR_INDEX_NAME, MONGODB_VECTOR_INDEX_ENV_VAR } from "./constants";
+import { mongoDbManager } from "./mongoDbManager";
+import { dataCache } from "./cacheUtils";
+import { DataBaristaLogger } from "./loggingUtils";
+
+/**
+ * Interface for match request record
+ */
+interface MatchRequest {
+  timestamp: Date;
+  count: number;
+}
+
+/**
+ * Interface for match history record
+ */
+interface MatchRecord {
+  platform: string;
+  username: string;
+  timestamp: Date;
+}
 
 /**
  * Interface for profile data returned from MongoDB CKG
@@ -23,22 +43,17 @@ interface ProfileData {
   latestProfile: {
     public: any;
     private: any;
+    ideal?: string;
     timestamp?: Date;
     embedding?: number[];
+    ideal_embedding?: number[];
   };
   timestamp?: Date;
   lastUpdated?: Date;
   // Match history to avoid repetitive matches
-  matchHistory?: Array<{
-    platform: string;
-    username: string;
-    timestamp: Date;
-  }>;
+  matchHistory?: MatchRecord[];
   // Match request timestamps for rate limiting
-  matchRequests?: Array<{
-    timestamp: Date;
-    count: number;
-  }>;
+  matchRequests?: MatchRequest[];
   // Store original Telegram chat ID for sending notifications
   telegramChatId?: string;
   agentUsername?: string;
@@ -82,20 +97,20 @@ export async function generateIdealMatchProfile(
   state?: State
 ): Promise<string | null> {
   try {
-    elizaLogger.debug('Generating ideal match profile using combined profile generator');
+    DataBaristaLogger.debug('Generating ideal match profile using combined profile generator');
     
     // Use the new combined profile generator
     const combinedProfile = await generateCombinedProfile(runtime, userProfileData, state);
     
     if (!combinedProfile) {
-      elizaLogger.error("Failed to generate combined profile for ideal match");
+      DataBaristaLogger.error("Failed to generate combined profile for ideal match");
       return null;
     }
     
     // Return just the ideal section
     return combinedProfile.ideal;
   } catch (error) {
-    elizaLogger.error(`Error generating ideal match profile: ${error instanceof Error ? error.message : String(error)}`);
+    DataBaristaLogger.error(`Error generating ideal match profile: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
 }
@@ -158,14 +173,14 @@ export async function generateProfileEmbedding(
     ].filter(Boolean).join(" ");
     
     if (!textToEmbed.trim()) {
-      elizaLogger.warn("No meaningful text found to embed for profile");
+      DataBaristaLogger.warn("No meaningful text found to embed for profile");
       return null;
     }
     
     // Use ElizaOS Core embedding service
     return await embed(runtime, textToEmbed);
   } catch (error) {
-    elizaLogger.error("Error generating profile embedding:", error);
+    DataBaristaLogger.error("Error generating profile embedding:", error);
     return null;
   }
 }
@@ -195,13 +210,14 @@ export async function findMatchingProfilesWithAtlasSearch(
     
     // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return [];
     }
     
-    const client = await MongoClient.connect(connectionString);
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for Atlas search in ${Date.now() - startTime}ms`);
     
     // Get bot username to filter users from the same community
     const myBotUsername = typeof state === 'string' 
@@ -228,13 +244,13 @@ export async function findMatchingProfilesWithAtlasSearch(
         excludeList.push(...recentMatches);
       }
     } catch (error) {
-      elizaLogger.warn("Error fetching match history:", error);
+      DataBaristaLogger.warn("Error fetching match history:", error);
       // Continue with search even if we can't get match history
     }
     
     // Get vector index name from environment
     const vectorIndexName = runtime.getSetting('MONGODB_VECTOR_INDEX') || 'text_embedding_index';
-    elizaLogger.info(`Using vector index name: ${vectorIndexName}`);
+    DataBaristaLogger.info(`Using vector index name: ${vectorIndexName}`);
     
     // Define the search pipeline
     const pipeline = [
@@ -287,11 +303,9 @@ export async function findMatchingProfilesWithAtlasSearch(
       telegramChatId: match.telegramChatId
     }));
     
-    await client.close();
-    
     return result;
   } catch (error) {
-    elizaLogger.error("Atlas search failed:", error);
+    DataBaristaLogger.error("Atlas search failed:", error);
     return [];
   }
 }
@@ -338,99 +352,95 @@ Hope you two stir up something amazing together! Thanks a latte! ☕️✨
     );
     
     if (notificationSent) {
-      elizaLogger.info(`Successfully notified ${matchedUsername} about the match with ${username}`);
+      DataBaristaLogger.info(`Successfully notified ${matchedUsername} about the match with ${username}`);
     } else {
-      elizaLogger.warn(`Failed to notify ${matchedUsername} about the match with ${username}`);
+      DataBaristaLogger.warn(`Failed to notify ${matchedUsername} about the match with ${username}`);
     }
     
     return notificationSent;
   } catch (error) {
-    elizaLogger.error(`Error notifying matched user: ${error}`);
+    DataBaristaLogger.error(`Error notifying matched user: ${error}`);
     return false;
   }
 }
 
 /**
- * Check if a user has reached their match request limit (5 matches in 24 hours)
+ * Check if a user has reached their match limit
+ * 
  * @param runtime Agent runtime
  * @param platform User platform
  * @param username User username
- * @returns Object with isLimited boolean and remaining count
+ * @returns Object with isLimited boolean and resetTime
  */
 export async function checkMatchLimit(
   runtime: IAgentRuntime,
   platform: string,
   username: string
-): Promise<{ isLimited: boolean; remaining: number; resetTime?: Date }> {
+): Promise<{
+  isLimited: boolean;
+  remaining?: number;
+  resetTime?: Date;
+}> {
   try {
+    // Get MongoDB connection info
     const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
     const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
-    
-    if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
-      return { isLimited: false, remaining: DAILY_MATCH_LIMIT };
-    }
-    
-    const client = new MongoClient(connectionString);
-    await client.connect();
-    
-    const db = client.db(dbName);
-    // Check if MONGODB_DATABASE_COLLECTION is set in environment, otherwise use platform
     const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
-    const collection = db.collection(collectionName);
     
-    // Get the user profile
-    const profile = await collection.findOne(
-      { platform, username },
-      { projection: { matchRequests: 1 } }
-    );
+    // Validate connection info
+    if (!connectionString || !dbName) {
+      DataBaristaLogger.error('Missing MongoDB connection settings');
+      return { isLimited: false };
+    }
     
-    await client.close();
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for match limit check in ${Date.now() - startTime}ms`);
     
-    if (!profile) {
-      // If no profile, they haven't made any requests yet
+    // Find user document
+    const userDoc = await collection.findOne({ platform, username });
+    
+    if (!userDoc) {
       return { isLimited: false, remaining: DAILY_MATCH_LIMIT };
     }
     
-    const matchRequests = profile.matchRequests || [];
     const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
     
-    // Filter requests made in the last 24 hours
-    const recentRequests = matchRequests.filter(request => 
-      new Date(request.timestamp) > oneDayAgo
+    // Filter requests from today only
+    const todayRequests = (userDoc.matchRequests || []).filter((req: any) => 
+      new Date(req.timestamp) >= today && new Date(req.timestamp) < tomorrow
     );
     
-    // Calculate total count of requests in the last 24 hours
-    const totalCount = recentRequests.reduce((sum, request) => sum + request.count, 0);
+    // Count total requests today
+    const totalRequests = todayRequests.reduce((sum: number, req: any) => sum + (req.count || 1), 0);
     
-    // Check if limit is reached
-    const isLimited = totalCount >= DAILY_MATCH_LIMIT;
-    const remaining = Math.max(0, DAILY_MATCH_LIMIT - totalCount);
+    // Determine if user has reached their limit
+    const isLimited = totalRequests >= DAILY_MATCH_LIMIT;
+    const remaining = Math.max(0, DAILY_MATCH_LIMIT - totalRequests);
     
-    // Calculate when the limit will reset (when the oldest request becomes > 24h old)
-    let resetTime;
-    if (recentRequests.length > 0 && isLimited) {
-      const oldestRequest = recentRequests.reduce((oldest, current) => 
-        new Date(oldest.timestamp) < new Date(current.timestamp) ? oldest : current
-      );
-      resetTime = new Date(new Date(oldestRequest.timestamp).getTime() + 24 * 60 * 60 * 1000);
-    }
-    
-    return { isLimited, remaining, resetTime };
+    return {
+      isLimited,
+      remaining,
+      resetTime: tomorrow
+    };
   } catch (error) {
-    elizaLogger.error('Error checking match limit:', error);
-    // Default to not limited in case of error
-    return { isLimited: false, remaining: DAILY_MATCH_LIMIT };
+    DataBaristaLogger.error(`Error checking match limit: ${error}`);
+    // Default to not limited if there's an error
+    return { isLimited: false };
   }
 }
 
 /**
- * Record a match request for rate limiting purposes
+ * Record a match request for rate limiting
+ * 
  * @param runtime Agent runtime
  * @param platform User platform
  * @param username User username
- * @returns Success status
+ * @returns Boolean indicating success
  */
 export async function recordMatchRequest(
   runtime: IAgentRuntime,
@@ -438,191 +448,124 @@ export async function recordMatchRequest(
   username: string
 ): Promise<boolean> {
   try {
+    // Get MongoDB connection info
     const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
     const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
     
+    // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return false;
     }
     
-    const client = new MongoClient(connectionString);
-    await client.connect();
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for recording match request in ${Date.now() - startTime}ms`);
     
-    const db = client.db(dbName);
-    // Check if MONGODB_DATABASE_COLLECTION is set in environment, otherwise use platform
-    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
-    const collection = db.collection(collectionName);
-    
+    // Current timestamp
     const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     
-    // First check if there's already a match request for today
-    const userDoc = await collection.findOne(
-      { 
-        platform, 
-        username,
-        matchRequests: { 
-          $elemMatch: { 
-            timestamp: { 
-              $gte: today 
-            } 
+    // Add match request record with type assertion
+    await collection.updateOne(
+      { platform, username },
+      {
+        $push: {
+          matchRequests: {
+            timestamp: now,
+            count: 1
           }
         }
-      }
+      } as any,
+      { upsert: true }
     );
     
-    let result;
-    if (userDoc) {
-      // Update existing request count for today using a type-safe approach
-      const updateDoc: Record<string, any> = {
-        $inc: {}
-      };
-      updateDoc.$inc["matchRequests.$.count"] = 1;
-      
-      result = await collection.updateOne(
-        { 
-          platform, 
-          username,
-          "matchRequests.timestamp": { $gte: today }
-        },
-        updateDoc
-      );
-    } else {
-      // Add a new request record using a type-safe approach
-      const updateDoc: Record<string, any> = {
-        $push: {}
-      };
-      updateDoc.$push.matchRequests = {
-        timestamp: now,
-        count: 1
-      };
-      
-      result = await collection.updateOne(
-        { platform, username },
-        updateDoc,
-        { upsert: true }
-      );
-    }
-    
-    await client.close();
-    
-    return result.acknowledged;
+    return true;
   } catch (error) {
-    elizaLogger.error('Error recording match request:', error);
+    DataBaristaLogger.error(`Error recording match request: ${error}`);
     return false;
   }
 }
 
 /**
- * Store matches in user's profile to avoid repetition
- * Also records bidirectional matches - both user->match and match->user
+ * Record matches between users
+ * 
  * @param runtime Agent runtime
- * @param userPlatform User platform
- * @param userUsername User username
+ * @param platform User platform
+ * @param username User username
  * @param matches Array of matches to record
- * @returns Success status
+ * @returns Boolean indicating success
  */
 export async function recordMatches(
   runtime: IAgentRuntime,
-  userPlatform: string,
-  userUsername: string,
-  matches: Array<{ platform: string; username: string }>
+  platform: string,
+  username: string,
+  matches: Array<{
+    platform: string;
+    username: string;
+    timestamp: Date;
+  }>
 ): Promise<boolean> {
   try {
     if (!matches || matches.length === 0) {
-      return true; // Nothing to record
+      DataBaristaLogger.info(`No matches to record for ${username}`);
+      return true;
     }
     
+    // Get MongoDB connection info
     const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
     const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
     
+    // Validate connection info
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return false;
     }
     
-    const client = new MongoClient(connectionString);
-    await client.connect();
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for recording matches in ${Date.now() - startTime}ms`);
     
-    const db = client.db(dbName);
+    // Update the user's match history with type assertion
+    await collection.updateOne(
+      { platform, username },
+      {
+        $push: {
+          matchHistory: {
+            $each: matches
+          }
+        }
+      } as any,
+      { upsert: true }
+    );
     
-    try {
-      // Create an array of operations to perform
-      const operations = [];
-      const now = new Date();
+    // Also record match in the matched users' documents
+    for (const match of matches) {
+      // Skip if the match doesn't have platform or username
+      if (!match.platform || !match.username) continue;
       
-      // 1. Format the matches with timestamps for the current user
-      const matchesWithTimestamp = matches.map(match => ({
-        platform: match.platform,
-        username: match.username,
-        timestamp: now
-      }));
-      
-      // 2. Add matches to current user's match history
-      const userCollectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || userPlatform;
-      const userCollection = db.collection(userCollectionName);
-      
-      const userUpdate: Record<string, any> = {
-        $push: {}
-      };
-      userUpdate.$push.matchHistory = { $each: matchesWithTimestamp };
-      
-      operations.push(
-        userCollection.updateOne(
-          { platform: userPlatform, username: userUsername },
-          userUpdate,
-          { upsert: true }
-        )
+      // Record the current user in the matched user's history with type assertion
+      await collection.updateOne(
+        { platform: match.platform, username: match.username },
+        {
+          $push: {
+            matchHistory: {
+              platform,
+              username,
+              timestamp: match.timestamp
+            }
+          }
+        } as any,
+        { upsert: true }
       );
-      
-      // 3. Add current user to each matched user's history
-      for (const match of matches) {
-        // The current user's profile data to add to the matched user's history
-        const currentUserMatchData = {
-          platform: userPlatform,
-          username: userUsername,
-          timestamp: now
-        };
-        
-        // Get the appropriate collection for the matched user (could be on a different platform)
-        const matchedUserCollectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || match.platform;
-        const matchedUserCollection = db.collection(matchedUserCollectionName);
-        
-        // Prepare update for matched user
-        const matchedUserUpdate: Record<string, any> = {
-          $push: {}
-        };
-        matchedUserUpdate.$push.matchHistory = { $each: [currentUserMatchData] };
-        
-        operations.push(
-          matchedUserCollection.updateOne(
-            { platform: match.platform, username: match.username },
-            matchedUserUpdate,
-            { upsert: true }
-          )
-        );
-        
-        elizaLogger.info(`Recording bidirectional match: ${userUsername} <-> ${match.username}`);
-      }
-      
-      // Execute all operations
-      const results = await Promise.all(operations);
-      
-      // Check if all operations were successful
-      const allSuccessful = results.every(result => result.acknowledged);
-      
-      elizaLogger.info(
-        `Recorded ${matches.length} bidirectional matches for ${userUsername} on ${userPlatform}: ${allSuccessful ? 'success' : 'partial failure'}`
-      );
-      
-      return allSuccessful;
-    } finally {
-      // Ensure connection is closed even if operation fails
-      await client.close();
     }
+    
+    return true;
   } catch (error) {
-    elizaLogger.error('Error recording matches:', error);
+    DataBaristaLogger.error(`Error recording matches: ${error}`);
     return false;
   }
 }
@@ -642,30 +585,26 @@ export async function getMatchHistory(
   try {
     const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
     const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
     
     if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
+      DataBaristaLogger.error('Missing MongoDB connection settings');
       return [];
     }
     
-    const client = new MongoClient(connectionString);
-    await client.connect();
-    
-    const db = client.db(dbName);
-    // Check if MONGODB_DATABASE_COLLECTION is set in environment, otherwise use platform
-    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
-    const collection = db.collection(collectionName);
+    // Get MongoDB collection from the connection pool
+    const startTime = Date.now();
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    DataBaristaLogger.info(`MongoDB collection obtained for getting match history in ${Date.now() - startTime}ms`);
     
     const profile = await collection.findOne(
       { platform, username },
       { projection: { matchHistory: 1 } }
     );
     
-    await client.close();
-    
     return profile?.matchHistory || [];
   } catch (error) {
-    elizaLogger.error('Error getting match history:', error);
+    DataBaristaLogger.error('Error getting match history:', error);
     return [];
   }
 }
@@ -693,7 +632,7 @@ export async function sendNotification(
       const userProfile = await getUserProfile(runtime, username);
       
       if (!userProfile) {
-        elizaLogger.warn(`No user profile found for user ${username}`);
+        DataBaristaLogger.warn(`No user profile found for user ${username}`);
         return false;
       }
       
@@ -701,7 +640,7 @@ export async function sendNotification(
       const agentUsername = userProfile.agentUsername;
       
       if (!storedChatId) {
-        elizaLogger.warn(`No chat ID found for user ${username}`);
+        DataBaristaLogger.warn(`No chat ID found for user ${username}`);
         return false;
       }
       
@@ -710,7 +649,7 @@ export async function sendNotification(
         const botToken = getTelegramBotToken(runtime, agentUsername);
         
         if (!botToken) {
-          elizaLogger.error(`No Telegram bot token configured for agent ${agentUsername}`);
+          DataBaristaLogger.error(`No Telegram bot token configured for agent ${agentUsername}`);
           return false;
         }
         
@@ -720,17 +659,17 @@ export async function sendNotification(
         
         // Send the message using the temporary bot
         await tempBot.telegram.sendMessage(storedChatId, message);
-        elizaLogger.info(`Successfully sent message to ${username} using bot for agent ${agentUsername}`);
+        DataBaristaLogger.info(`Successfully sent message to ${username} using bot for agent ${agentUsername}`);
         return true;
       } catch (error) {
-        elizaLogger.error(`Failed to send Telegram message to ${username}: ${error}`);
+        DataBaristaLogger.error(`Failed to send Telegram message to ${username}: ${error}`);
         return false;
       }
     }
 
     return false;
   } catch (error) {
-    elizaLogger.error(`Error in sendNotification: ${error}`);
+    DataBaristaLogger.error(`Error in sendNotification: ${error}`);
     return false;
   }
 }
@@ -770,36 +709,41 @@ async function getUserProfile(runtime: IAgentRuntime, username: string): Promise
     // Clean the username - ensure no @ prefix for database queries
     const cleanUsername = username.replace(/^@/, '');
     
-    const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
-    const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+    // Generate a cache key for this user profile
+    const cacheKey = `profile:telegram:${cleanUsername}`;
     
-    if (!connectionString || !dbName) {
-      elizaLogger.error('Missing MongoDB connection settings');
-      return null;
-    }
-    
-    const client = new MongoClient(connectionString);
-    await client.connect();
-    
-    const db = client.db(dbName);
-    // For this specific function, we could either:
-    // 1. Use MONGODB_DATABASE_COLLECTION if set, or
-    // 2. Always use 'telegram' as it's hardcoded in the original code
-    // Let's go with option 1 to be consistent with other functions
-    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || 'telegram';
-    const collection = db.collection(collectionName);
-    
-    // Look for the user profile
-    const profile = await collection.findOne(
-      { platform: 'telegram', username: cleanUsername }
+    // Try to get the profile from cache first
+    return await dataCache.getOrCompute<ProfileData | null>(
+      cacheKey,
+      async () => {
+        // Cache miss - fetch from database
+        const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
+        const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+        const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || 'telegram';
+        
+        if (!connectionString || !dbName) {
+          DataBaristaLogger.error('Missing MongoDB connection settings');
+          return null;
+        }
+        
+        // Get MongoDB collection from the connection pool
+        const startTime = Date.now();
+        const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+        DataBaristaLogger.info(`MongoDB collection obtained for getting user profile in ${Date.now() - startTime}ms`);
+        
+        // Look for the user profile
+        const profile = await collection.findOne(
+          { platform: 'telegram', username: cleanUsername }
+        );
+        
+        // Cast the MongoDB document to ProfileData type and return
+        return profile as unknown as ProfileData;
+      },
+      // Cache profiles for 10 minutes
+      10 * 60 * 1000
     );
-    
-    await client.close();
-    
-    // Cast the MongoDB document to ProfileData type
-    return profile as unknown as ProfileData;
   } catch (error) {
-    elizaLogger.error(`Error retrieving profile for ${username}:`, error);
+    DataBaristaLogger.error(`Error retrieving profile for ${username}:`, error);
     return null;
   }
 }
@@ -827,7 +771,7 @@ export async function generateCombinedProfile(
   };
 } | null> {
   try {
-    elizaLogger.debug('Generating combined profile with all three components');
+    DataBaristaLogger.debug('Generating combined profile with all three components');
     
     // Update state with recent messages if not present
     if (state && !state.recentMessages) {
@@ -844,7 +788,7 @@ export async function generateCombinedProfile(
     };
     
     // Log minimal info about profile generation input
-    elizaLogger.info(`Generating profile for ${contextData.username} on ${contextData.platform}`);
+    DataBaristaLogger.info(`Generating profile for ${contextData.username} on ${contextData.platform}`);
 
     const context = composeContext({
       template: COMBINED_PROFILE_TEMPLATE,
@@ -852,7 +796,7 @@ export async function generateCombinedProfile(
     });
     
     // Log raw prompt content
-    elizaLogger.info(`RAW_PROFILE_PROMPT: ${context}`);
+    DataBaristaLogger.info(`RAW_PROFILE_PROMPT: ${context}`);
 
     const combinedProfileResult = await generateObjectArray({
       runtime,
@@ -861,10 +805,10 @@ export async function generateCombinedProfile(
     });
     
     // Log raw LLM response
-    elizaLogger.info(`RAW_PROFILE_RESPONSE: ${JSON.stringify(combinedProfileResult)}`);
+    DataBaristaLogger.info(`RAW_PROFILE_RESPONSE: ${JSON.stringify(combinedProfileResult)}`);
 
     if (!combinedProfileResult?.length) {
-      elizaLogger.error("Failed to generate combined profile: empty result");
+      DataBaristaLogger.error("Failed to generate combined profile: empty result");
       return null;
     }
 
@@ -872,10 +816,10 @@ export async function generateCombinedProfile(
     const result = combinedProfileResult[0];
     
     // Log minimal info about profile generation result
-    elizaLogger.info(`Profile generated for ${contextData.username} with match type: ${result.analysis?.matchType || 'unknown'}`);
+    DataBaristaLogger.info(`Profile generated for ${contextData.username} with match type: ${result.analysis?.matchType || 'unknown'}`);
     
     if (!result.private || !result.public || !result.ideal || !result.analysis) {
-      elizaLogger.error("Invalid combined profile format: missing required sections", result);
+      DataBaristaLogger.error("Invalid combined profile format: missing required sections", result);
       return null;
     }
     
@@ -886,7 +830,7 @@ export async function generateCombinedProfile(
       analysis: result.analysis
     };
   } catch (error) {
-    elizaLogger.error(`Error generating combined profile: ${error instanceof Error ? error.message : String(error)}`);
+    DataBaristaLogger.error(`Error generating combined profile: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
 }
@@ -922,7 +866,7 @@ export async function generateCombinedProfileEmbeddings(
     
     if (!profileEmbedding || profileEmbedding.length === 0 || 
         !idealEmbedding || idealEmbedding.length === 0) {
-      elizaLogger.warn("Failed to generate one or both embeddings for combined profile");
+      DataBaristaLogger.warn("Failed to generate one or both embeddings for combined profile");
       return null;
     }
     
@@ -931,7 +875,7 @@ export async function generateCombinedProfileEmbeddings(
       ideal_embedding: idealEmbedding
     };
   } catch (error) {
-    elizaLogger.error("Error generating combined profile embeddings:", error);
+    DataBaristaLogger.error("Error generating combined profile embeddings:", error);
     return null;
   }
 } 
