@@ -81,6 +81,82 @@ async function createInitialUserProfile(
 }
 
 /**
+ * Updates the telegramChatId and agentUsername if they've changed
+ * This ensures notifications can be delivered even if the user changes chats or interacts with a different bot
+ */
+async function updateUserConnectionInfo(
+  runtime: IAgentRuntime,
+  platform: string,
+  username: string,
+  telegramChatId?: string,
+  agentUsername?: string
+): Promise<boolean> {
+  if (platform !== 'telegram' || !telegramChatId || !agentUsername) {
+    return false; // Only proceed for Telegram with valid data
+  }
+  
+  try {
+    // Get MongoDB connection info
+    const connectionString = runtime.getSetting('MONGODB_CONNECTION_STRING_CKG');
+    const dbName = runtime.getSetting('MONGODB_DATABASE_CKG');
+    const collectionName = runtime.getSetting('MONGODB_DATABASE_COLLECTION') || platform;
+    
+    if (!connectionString || !dbName) {
+      DataBaristaLogger.error('Missing MongoDB connection settings');
+      return false;
+    }
+    
+    // Get MongoDB collection from the connection pool
+    const collection = await mongoDbManager.getCollection(connectionString, dbName, collectionName);
+    
+    // Find existing document for this user
+    const existingDoc = await collection.findOne({ platform, username });
+    
+    if (!existingDoc) {
+      return false; // No existing profile to update
+    }
+    
+    // Check if chatId or agentUsername have changed
+    const needsUpdate = (
+      existingDoc.telegramChatId !== telegramChatId || 
+      existingDoc.agentUsername !== agentUsername
+    );
+    
+    if (needsUpdate) {
+      DataBaristaLogger.info(`Updating connection info for ${username}:`, {
+        oldChatId: existingDoc.telegramChatId,
+        newChatId: telegramChatId,
+        oldAgentUsername: existingDoc.agentUsername,
+        newAgentUsername: agentUsername
+      });
+      
+      // Update the connection info
+      await collection.updateOne(
+        { platform, username },
+        {
+          $set: {
+            telegramChatId,
+            agentUsername,
+            lastUpdated: new Date()
+          }
+        }
+      );
+      
+      // Clear the cache to ensure fresh data is loaded next time
+      const cacheKey = `profile:${platform}:${username}`;
+      dataCache.delete(cacheKey);
+      
+      return true;
+    }
+    
+    return false; // No update needed
+  } catch (error) {
+    DataBaristaLogger.error(`Error updating connection info for ${username}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/**
  * Format user profile data for agent context
  * Only includes essential text fields for better performance
  */
@@ -119,6 +195,30 @@ const userProfileProvider: Provider = {
 
       DataBaristaLogger.info("Retrieving user profile:", { username, platform });
 
+      // Get Telegram chat ID if available
+      let telegramChatId: string | undefined;
+      let agentUsername: string | undefined;
+      
+      if (platform === 'telegram') {
+        const telegramClient = runtime.clients['telegram'] as any;
+        
+        // Get current bot username
+        agentUsername = telegramClient?.bot?.botInfo?.username?.replace(/^@/, '') || 
+                       runtime.character?.username || 
+                       runtime.character?.name;
+        
+        // Try to get chat ID from different sources
+        if ((message as any).content?.chatId) {
+          telegramChatId = (message as any).content.chatId;
+        } else if (telegramClient?.messageManager?.getUserChatId) {
+          telegramChatId = telegramClient.messageManager.getUserChatId(username);
+        }
+        
+        if (telegramChatId && agentUsername) {
+          DataBaristaLogger.debug(`Current connection info for ${username}: chatId=${telegramChatId}, agentUsername=${agentUsername}`);
+        }
+      }
+
       // Get profile using the profileUtils.getProfile function
       // This already utilizes the caching mechanism from dataCache
       let userData = await getProfile(runtime, platform, username);
@@ -126,20 +226,6 @@ const userProfileProvider: Provider = {
       // If no data found, create an initial profile
       if (!userData || userData.length === 0) {
         DataBaristaLogger.info(`No profile found for ${username}, creating initial profile`);
-        
-        // Get Telegram chat ID if available
-        let telegramChatId: string | undefined;
-        
-        if (platform === 'telegram') {
-          const telegramClient = runtime.clients['telegram'] as any;
-          
-          // Try to get chat ID from different sources
-          if ((message as any).content?.chatId) {
-            telegramChatId = (message as any).content.chatId;
-          } else if (telegramClient?.messageManager?.getUserChatId) {
-            telegramChatId = telegramClient.messageManager.getUserChatId(username);
-          }
-        }
         
         // Create initial profile with minimal data
         await createInitialUserProfile(runtime, platform, username, telegramChatId, state);
@@ -150,6 +236,27 @@ const userProfileProvider: Provider = {
         // Still no profile data (creation might have failed)
         if (!userData || userData.length === 0) {
           return `No profile information found yet for @${username}. Continuing conversation to learn more about user's needs and interests.`;
+        }
+      } else if (platform === 'telegram' && telegramChatId && agentUsername) {
+        // Check if we need to update the connection info
+        const existingProfile = userData[0];
+        
+        if (existingProfile.telegramChatId !== telegramChatId || 
+            existingProfile.agentUsername !== agentUsername) {
+          
+          // Connection info needs to be updated
+          await updateUserConnectionInfo(runtime, platform, username, telegramChatId, agentUsername);
+          
+          // Log the update
+          DataBaristaLogger.info(`Updated connection info for ${username}:`, {
+            oldChatId: existingProfile.telegramChatId,
+            newChatId: telegramChatId,
+            oldAgentUsername: existingProfile.agentUsername,
+            newAgentUsername: agentUsername
+          });
+          
+          // Refresh profile data
+          userData = await getProfile(runtime, platform, username);
         }
       }
 

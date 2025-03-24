@@ -259,7 +259,7 @@ Guidelines:
 2. Create three distinct text sections, each focused on a specific aspect of the profile:
 
 a) PRIVATE SECTION:
-Create a comprehensive text (200-350 words) about the user's background, expertise, and personal context.
+Create a comprehensive text (100-250 words) about the user's background, expertise, and personal context.
 This section should cover:
 - Professional background and career history
 - Education and training
@@ -271,7 +271,7 @@ This section should cover:
 - Strengths and capabilities
 
 b) PUBLIC SECTION:
-Create a detailed text (200-350 words) about the user's networking goals and preferences.
+Create a detailed text (100-250 words) about the user's networking goals and preferences.
 This section should cover:
 - Current professional goals and intentions
 - Projects they're working on or planning
@@ -283,7 +283,7 @@ This section should cover:
 - Value they offer to potential connections
 
 c) IDEAL MATCH SECTION:
-Create a detailed text (300-450 words) describing the ideal match for this user.
+Create a detailed text (200-350 words) describing the ideal match for this user.
 This section should cover TWO key aspects:
 1. The background, expertise, and capabilities of their ideal match:
    - Professional background and expertise level

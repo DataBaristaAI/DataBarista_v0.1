@@ -607,7 +607,7 @@ export const publishAndFindMatch: Action = {
       {
         user: "DataBarista",
         content: {
-          "text": "Great, I'll post an introduction and tag both you and a growth specialist from my network as soon as I find a match! Wish to add any additional details?",
+          "text": "Great, I'll post an introduction and tag both you and a growth specialist from my network as soon as I find a match!",
           "action": "(PUBLISH_AND_FIND_MATCH)"
         },
       }
@@ -616,7 +616,7 @@ export const publishAndFindMatch: Action = {
       {
         "user": "DataBarista",
         "content": {
-          "text": "Great, I'll post an introduction and tag both you and a crowdfunding expert from my network as soon as I find a match! Wish to add any additional details? (PUBLISH_DKG_INTENT)",
+          "text": "Great, I'll post an introduction and tag both you and a crowdfunding expert from my network as soon as I find a match! (PUBLISH_DKG_INTENT)",
           "action": "(PUBLISH_AND_FIND_MATCH)"
         }
       },
