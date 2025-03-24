@@ -15,7 +15,7 @@ Potential Match Data:
 {{matchesData}}
 
 Task:
-From the above data, choose the best match that is mutual for both user and the match, benefiting from a potential overlapping opportunity.
+From the above data, choose the best match that is mutual for both user and the potentialmatch, benefiting mutually from an overlapping opportunity. Make sure the selected match fits the user's goals, especially if someone is searching for someone to have technical collaborations, that the match has the knowledge and skills to help the user.
 IMPORTANT: Never select the user's own profile as a match. If the user's profile appears in the potential matches, ignore it and select a different match. If a match works at a similar company with the user, do not select it, since they might already know each other.
 
 Generate a friendly social media post that introduces the user and the best match together.

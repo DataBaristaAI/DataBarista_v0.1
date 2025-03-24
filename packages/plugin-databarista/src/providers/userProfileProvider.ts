@@ -268,7 +268,7 @@ Profile for @${username}:
 \`\`\`json
 ${formattedProfile}
 \`\`\`
-Task: Based on the profile and recent conversation, engage naturally to gather more information about the user's interests and what connections they're seeking. Focus on understanding their professional background, current projects, and the type of people they want to connect with.
+Task: Based on the profile and recent conversation, engage naturally to gather necessary information about the user's interests and what connections they're seeking and if you have the information, find a match for them.
 `;
     } catch (error) {
       DataBaristaLogger.error("Error in userProfileProvider:", error);
